@@ -1,0 +1,4 @@
+github.com/Abraxas-365/craftable v1.8.7 h1:V0nyhR7FkReb+XMGSJmgNAP9XxrLTB7yQ3uPu5ahW/M=
+github.com/Abraxas-365/craftable v1.8.7/go.mod h1:KDkTS5qJmWOHypxBQu/OV7Fz7XWQCgbpk13lmO9n60U=
+github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
+github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
