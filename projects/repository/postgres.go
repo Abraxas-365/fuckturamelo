@@ -16,6 +16,12 @@ import (
 	"github.com/Abraxas-365/fuckturamelo/projects/models"
 )
 
+const (
+	DefaultPageSize  = 20
+	MaxPageSize      = 1000
+	DefaultSortField = "created_at"
+)
+
 // projectRepository implements ProjectRepository using storex
 type projectRepository struct {
 	repo         *storexpostgres.PgRepository[models.Project]
@@ -91,9 +97,15 @@ func (r *projectRepository) GetByIDWithProviders(ctx context.Context, id uuid.UU
 		return nil, err
 	}
 
+	// Convert pointer slice to value slice
+	providerValues := make([]models.ProjectProviderDetails, len(providers))
+	for i, provider := range providers {
+		providerValues[i] = *provider
+	}
+
 	return &models.ProjectWithProviders{
 		Project:   *project,
-		Providers: &providers,
+		Providers: providerValues,
 	}, nil
 }
 
@@ -138,31 +150,41 @@ func (r *projectRepository) Delete(ctx context.Context, id uuid.UUID) error {
 
 // List retrieves projects with pagination and filtering
 func (r *projectRepository) List(ctx context.Context, req *dto.ProjectListRequest) (*dto.ProjectListResponse, error) {
-	opts := storex.PaginationOptions{
-		Page:     req.Page,
-		PageSize: req.PageSize,
-		SortBy:   req.SortBy,
-		SortDesc: req.SortOrder == "desc",
+	// Set defaults
+	if req.Page == 0 {
+		req.Page = 1
+	}
+	if req.PageSize == 0 {
+		req.PageSize = DefaultPageSize
+	}
+	if req.PageSize > MaxPageSize {
+		req.PageSize = MaxPageSize
+	}
+	if req.SortBy == "" {
+		req.SortBy = DefaultSortField
 	}
 
-	// Build filters
-	filters := make(map[string]interface{})
+	// Handle search separately if provided (PostgreSQL-specific implementation)
+	if req.Search != nil && *req.Search != "" {
+		return r.searchProjects(ctx, req)
+	}
+
+	// Build basic filters for storex
+	filters := make(map[string]any)
 	if req.OrganizationID != nil {
 		filters["organization_id"] = *req.OrganizationID
 	}
 	if req.IsActive != nil {
 		filters["is_active"] = *req.IsActive
 	}
-	if req.Search != nil && *req.Search != "" {
-		// Use ILIKE for case-insensitive search on name and description
-		query := fmt.Sprintf("%%%s%%", *req.Search)
-		filters["$or"] = []map[string]interface{}{
-			{"name": map[string]interface{}{"$ilike": query}},
-			{"description": map[string]interface{}{"$ilike": query}},
-		}
-	}
 
-	opts.Filters = filters
+	opts := storex.PaginationOptions{
+		Page:     req.Page,
+		PageSize: req.PageSize,
+		OrderBy:  req.SortBy,              // Fixed: was SortBy
+		Desc:     req.SortOrder == "desc", // Fixed: was SortDesc
+		Filters:  filters,
+	}
 
 	result, err := r.repo.Paginate(ctx, opts)
 	if err != nil {
@@ -170,7 +192,95 @@ func (r *projectRepository) List(ctx context.Context, req *dto.ProjectListReques
 			WithCause(err)
 	}
 
+	return r.buildListResponse(result), nil
+}
+
+// searchProjects handles search functionality with raw SQL for better performance
+func (r *projectRepository) searchProjects(ctx context.Context, req *dto.ProjectListRequest) (*dto.ProjectListResponse, error) {
+	searchQuery := fmt.Sprintf("%%%s%%", strings.TrimSpace(*req.Search))
+
+	// Build base WHERE clause
+	whereConditions := []string{"(name ILIKE $1 OR description ILIKE $1)"}
+	args := []any{searchQuery}
+	argIndex := 2
+
+	// Add additional filters
+	if req.OrganizationID != nil {
+		whereConditions = append(whereConditions, fmt.Sprintf("organization_id = $%d", argIndex))
+		args = append(args, *req.OrganizationID)
+		argIndex++
+	}
+	if req.IsActive != nil {
+		whereConditions = append(whereConditions, fmt.Sprintf("is_active = $%d", argIndex))
+		args = append(args, *req.IsActive)
+		argIndex++
+	}
+
+	whereClause := strings.Join(whereConditions, " AND ")
+
+	// Build ORDER BY clause
+	orderDirection := "ASC"
+	if req.SortOrder == "desc" {
+		orderDirection = "DESC"
+	}
+	orderBy := fmt.Sprintf("ORDER BY %s %s", req.SortBy, orderDirection)
+
+	// Calculate offset
+	offset := (req.Page - 1) * req.PageSize
+
+	// Execute count query
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM projects WHERE %s", whereClause)
+	var total int64
+	err := r.db.GetContext(ctx, &total, countQuery, args...)
+	if err != nil {
+		return nil, projects.ProjectsErrors.New(projects.ErrProjectListFailed).
+			WithDetail("search", *req.Search).
+			WithCause(err)
+	}
+
+	// Execute data query
+	dataQuery := fmt.Sprintf(`
+		SELECT * FROM projects 
+		WHERE %s 
+		%s 
+		LIMIT $%d OFFSET $%d
+	`, whereClause, orderBy, argIndex, argIndex+1)
+
+	args = append(args, req.PageSize, offset)
+
+	var projectList []models.Project
+	err = r.db.SelectContext(ctx, &projectList, dataQuery, args...)
+	if err != nil {
+		return nil, projects.ProjectsErrors.New(projects.ErrProjectListFailed).
+			WithDetail("search", *req.Search).
+			WithCause(err)
+	}
+
 	// Convert to response format
+	projectPtrs := make([]*models.Project, len(projectList))
+	for i := range projectList {
+		projectPtrs[i] = &projectList[i]
+	}
+
+	// Calculate pagination metadata
+	totalPages := int(total) / req.PageSize
+	if int(total)%req.PageSize != 0 {
+		totalPages++
+	}
+
+	return &dto.ProjectListResponse{
+		Projects:    projectPtrs,
+		Total:       total,
+		Page:        req.Page,
+		PageSize:    req.PageSize,
+		TotalPages:  totalPages,
+		HasNext:     req.Page < totalPages,
+		HasPrevious: req.Page > 1,
+	}, nil
+}
+
+// buildListResponse converts storex.Paginated to dto.ProjectListResponse
+func (r *projectRepository) buildListResponse(result storex.Paginated[models.Project]) *dto.ProjectListResponse {
 	projectPtrs := make([]*models.Project, len(result.Data))
 	for i := range result.Data {
 		projectPtrs[i] = &result.Data[i]
@@ -178,26 +288,26 @@ func (r *projectRepository) List(ctx context.Context, req *dto.ProjectListReques
 
 	return &dto.ProjectListResponse{
 		Projects:    projectPtrs,
-		Total:       result.Total,
-		Page:        result.Page,
-		PageSize:    result.PageSize,
-		TotalPages:  result.TotalPages,
-		HasNext:     result.HasNext,
-		HasPrevious: result.HasPrevious,
-	}, nil
+		Total:       int64(result.Page.Total), // Fixed: was result.Total
+		Page:        result.Page.Number,       // Fixed: was result.Page
+		PageSize:    result.Page.Size,         // Fixed: was result.PageSize
+		TotalPages:  result.Page.Pages,        // Fixed: was result.TotalPages
+		HasNext:     result.HasNext(),         // Fixed: was result.HasNext
+		HasPrevious: result.HasPrevious(),     // Fixed: was result.HasPrevious
+	}
 }
 
 // GetByOrganization retrieves all projects for an organization
 func (r *projectRepository) GetByOrganization(ctx context.Context, orgID uuid.UUID) ([]*models.Project, error) {
-	filters := map[string]interface{}{
+	filters := map[string]any{
 		"organization_id": orgID,
 		"is_active":       true,
 	}
 
 	opts := storex.PaginationOptions{
 		Page:     1,
-		PageSize: 1000, // Large page size to get all active projects
-		SortBy:   "name",
+		PageSize: MaxPageSize, // Use constant instead of magic number
+		OrderBy:  "name",      // Fixed: was SortBy
 		Filters:  filters,
 	}
 
@@ -219,7 +329,7 @@ func (r *projectRepository) GetByOrganization(ctx context.Context, orgID uuid.UU
 
 // GetByNameAndOrganization retrieves a project by name within an organization
 func (r *projectRepository) GetByNameAndOrganization(ctx context.Context, name string, orgID uuid.UUID) (*models.Project, error) {
-	filters := map[string]interface{}{
+	filters := map[string]any{
 		"name":            name,
 		"organization_id": orgID,
 	}
@@ -242,7 +352,7 @@ func (r *projectRepository) GetByNameAndOrganization(ctx context.Context, name s
 
 // Search performs full-text search on projects
 func (r *projectRepository) Search(ctx context.Context, query string, orgID uuid.UUID) ([]*models.Project, error) {
-	searchQuery := fmt.Sprintf("%%%s%%", query)
+	searchQuery := fmt.Sprintf("%%%s%%", strings.TrimSpace(query))
 
 	sqlQuery := `
 		SELECT * FROM projects 
@@ -252,8 +362,8 @@ func (r *projectRepository) Search(ctx context.Context, query string, orgID uuid
 		ORDER BY name
 	`
 
-	var projects []models.Project
-	err := r.db.SelectContext(ctx, &projects, sqlQuery, orgID, searchQuery)
+	var projectList []models.Project
+	err := r.db.SelectContext(ctx, &projectList, sqlQuery, orgID, searchQuery)
 	if err != nil {
 		return nil, projects.ProjectsErrors.New(projects.ErrProjectSearchFailed).
 			WithDetail("query", query).
@@ -262,9 +372,9 @@ func (r *projectRepository) Search(ctx context.Context, query string, orgID uuid
 	}
 
 	// Convert to pointer slice
-	projectPtrs := make([]*models.Project, len(projects))
-	for i := range projects {
-		projectPtrs[i] = &projects[i]
+	projectPtrs := make([]*models.Project, len(projectList))
+	for i := range projectList {
+		projectPtrs[i] = &projectList[i]
 	}
 
 	return projectPtrs, nil
@@ -385,53 +495,89 @@ func (r *projectRepository) GetProjectsByProvider(ctx context.Context, providerI
 		ORDER BY p.name
 	`
 
-	var projects []*models.Project
-	err := r.db.SelectContext(ctx, &projects, query, providerID)
+	var projectList []*models.Project
+	err := r.db.SelectContext(ctx, &projectList, query, providerID)
 	if err != nil {
 		return nil, projects.ProjectsErrors.New(projects.ErrProjectListFailed).
 			WithDetail("provider_id", providerID.String()).
 			WithCause(err)
 	}
 
-	return projects, nil
+	return projectList, nil
 }
 
 // Bulk operations
 
-// CreateBulk creates multiple projects
-func (r *projectRepository) CreateBulk(ctx context.Context, projects []*models.Project) ([]*models.Project, error) {
+// CreateBulk creates multiple projects with transaction support
+func (r *projectRepository) CreateBulk(ctx context.Context, projectList []*models.Project) ([]*models.Project, error) {
+	if len(projectList) == 0 {
+		return projectList, nil
+	}
+
+	// Start transaction
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return nil, projects.ProjectsErrors.New(projects.ErrProjectBulkCreateFailed).
+			WithCause(err)
+	}
+	defer tx.Rollback()
+
 	// Generate IDs for projects without them
-	for _, project := range projects {
+	for _, project := range projectList {
 		if project.ID == uuid.Nil {
 			project.ID = uuid.New()
 		}
 	}
 
 	// Convert to value slice for bulk operation
-	valueProjects := make([]models.Project, len(projects))
-	for i, project := range projects {
+	valueProjects := make([]models.Project, len(projectList))
+	for i, project := range projectList {
 		valueProjects[i] = *project
 	}
 
-	err := r.bulk.BulkInsert(ctx, valueProjects)
+	err = r.bulk.BulkInsert(ctx, valueProjects)
 	if err != nil {
 		return nil, projects.ProjectsErrors.New(projects.ErrProjectBulkCreateFailed).
 			WithCause(err)
 	}
 
-	return projects, nil
+	// Commit transaction
+	if err = tx.Commit(); err != nil {
+		return nil, projects.ProjectsErrors.New(projects.ErrProjectBulkCreateFailed).
+			WithCause(err)
+	}
+
+	return projectList, nil
 }
 
-// UpdateBulk updates multiple projects
-func (r *projectRepository) UpdateBulk(ctx context.Context, projects []*models.Project) error {
+// UpdateBulk updates multiple projects with transaction support
+func (r *projectRepository) UpdateBulk(ctx context.Context, projectList []*models.Project) error {
+	if len(projectList) == 0 {
+		return nil
+	}
+
+	// Start transaction
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return projects.ProjectsErrors.New(projects.ErrProjectBulkUpdateFailed).
+			WithCause(err)
+	}
+	defer tx.Rollback()
+
 	// Convert to value slice for bulk operation
-	valueProjects := make([]models.Project, len(projects))
-	for i, project := range projects {
+	valueProjects := make([]models.Project, len(projectList))
+	for i, project := range projectList {
 		valueProjects[i] = *project
 	}
 
-	err := r.bulk.BulkUpdate(ctx, valueProjects)
+	err = r.bulk.BulkUpdate(ctx, valueProjects)
 	if err != nil {
+		return projects.ProjectsErrors.New(projects.ErrProjectBulkUpdateFailed).
+			WithCause(err)
+	}
+
+	// Commit transaction
+	if err = tx.Commit(); err != nil {
 		return projects.ProjectsErrors.New(projects.ErrProjectBulkUpdateFailed).
 			WithCause(err)
 	}
@@ -439,16 +585,34 @@ func (r *projectRepository) UpdateBulk(ctx context.Context, projects []*models.P
 	return nil
 }
 
-// DeleteBulk deletes multiple projects
+// DeleteBulk deletes multiple projects with transaction support
 func (r *projectRepository) DeleteBulk(ctx context.Context, ids []uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	// Start transaction
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return projects.ProjectsErrors.New(projects.ErrProjectBulkDeleteFailed).
+			WithCause(err)
+	}
+	defer tx.Rollback()
+
 	// Convert UUIDs to strings
 	stringIDs := make([]string, len(ids))
 	for i, id := range ids {
 		stringIDs[i] = id.String()
 	}
 
-	err := r.bulk.BulkDelete(ctx, stringIDs)
+	err = r.bulk.BulkDelete(ctx, stringIDs)
 	if err != nil {
+		return projects.ProjectsErrors.New(projects.ErrProjectBulkDeleteFailed).
+			WithCause(err)
+	}
+
+	// Commit transaction
+	if err = tx.Commit(); err != nil {
 		return projects.ProjectsErrors.New(projects.ErrProjectBulkDeleteFailed).
 			WithCause(err)
 	}
@@ -456,7 +620,7 @@ func (r *projectRepository) DeleteBulk(ctx context.Context, ids []uuid.UUID) err
 	return nil
 }
 
-// AddProvidersBulk adds multiple providers to a project
+// AddProvidersBulk adds multiple providers to a project with transaction support
 func (r *projectRepository) AddProvidersBulk(ctx context.Context, projectID uuid.UUID, providerIDs []uuid.UUID) error {
 	if len(providerIDs) == 0 {
 		return nil
@@ -468,12 +632,23 @@ func (r *projectRepository) AddProvidersBulk(ctx context.Context, projectID uuid
 		return err
 	}
 
-	// Build bulk insert query
+	// Start transaction
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return projects.ProjectsErrors.New(projects.ErrProjectProviderManagementFailed).
+			WithDetail("project_id", projectID.String()).
+			WithCause(err)
+	}
+	defer tx.Rollback()
+
+	// Build bulk insert query with proper parameter indexing
 	valueStrings := make([]string, len(providerIDs))
-	args := make([]interface{}, len(providerIDs)*4)
+	args := make([]any, len(providerIDs)*4)
 
 	for i, providerID := range providerIDs {
-		valueStrings[i] = fmt.Sprintf("($%d, $%d, $%d, $%d)", i*4+1, i*4+2, i*4+3, i*4+4)
+		// Fixed: Correct parameter indexing (1-based, not 0-based)
+		valueStrings[i] = fmt.Sprintf("($%d, $%d, $%d, $%d)",
+			i*4+1, i*4+2, i*4+3, i*4+4)
 		args[i*4] = uuid.New()
 		args[i*4+1] = projectID
 		args[i*4+2] = providerID
@@ -486,8 +661,15 @@ func (r *projectRepository) AddProvidersBulk(ctx context.Context, projectID uuid
 		ON CONFLICT (project_id, provider_id) DO NOTHING
 	`, strings.Join(valueStrings, ","))
 
-	_, err = r.db.ExecContext(ctx, query, args...)
+	_, err = tx.ExecContext(ctx, query, args...)
 	if err != nil {
+		return projects.ProjectsErrors.New(projects.ErrProjectProviderManagementFailed).
+			WithDetail("project_id", projectID.String()).
+			WithCause(err)
+	}
+
+	// Commit transaction
+	if err = tx.Commit(); err != nil {
 		return projects.ProjectsErrors.New(projects.ErrProjectProviderManagementFailed).
 			WithDetail("project_id", projectID.String()).
 			WithCause(err)
@@ -496,15 +678,24 @@ func (r *projectRepository) AddProvidersBulk(ctx context.Context, projectID uuid
 	return nil
 }
 
-// RemoveProvidersBulk removes multiple providers from a project
+// RemoveProvidersBulk removes multiple providers from a project with transaction support
 func (r *projectRepository) RemoveProvidersBulk(ctx context.Context, projectID uuid.UUID, providerIDs []uuid.UUID) error {
 	if len(providerIDs) == 0 {
 		return nil
 	}
 
+	// Start transaction
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return projects.ProjectsErrors.New(projects.ErrProjectProviderManagementFailed).
+			WithDetail("project_id", projectID.String()).
+			WithCause(err)
+	}
+	defer tx.Rollback()
+
 	// Build placeholders for IN clause
 	placeholders := make([]string, len(providerIDs))
-	args := make([]interface{}, len(providerIDs)+1)
+	args := make([]any, len(providerIDs)+1)
 	args[0] = projectID
 
 	for i, providerID := range providerIDs {
@@ -517,8 +708,15 @@ func (r *projectRepository) RemoveProvidersBulk(ctx context.Context, projectID u
 		WHERE project_id = $1 AND provider_id IN (%s)
 	`, strings.Join(placeholders, ","))
 
-	_, err := r.db.ExecContext(ctx, query, args...)
+	_, err = tx.ExecContext(ctx, query, args...)
 	if err != nil {
+		return projects.ProjectsErrors.New(projects.ErrProjectProviderManagementFailed).
+			WithDetail("project_id", projectID.String()).
+			WithCause(err)
+	}
+
+	// Commit transaction
+	if err = tx.Commit(); err != nil {
 		return projects.ProjectsErrors.New(projects.ErrProjectProviderManagementFailed).
 			WithDetail("project_id", projectID.String()).
 			WithCause(err)
@@ -532,7 +730,7 @@ func (r *projectRepository) RemoveProvidersBulk(ctx context.Context, projectID u
 // ExistsByNameAndOrganization checks if a project exists by name and organization
 func (r *projectRepository) ExistsByNameAndOrganization(ctx context.Context, name string, orgID uuid.UUID, excludeID *uuid.UUID) (bool, error) {
 	query := `SELECT COUNT(*) FROM projects WHERE name = $1 AND organization_id = $2`
-	args := []interface{}{name, orgID}
+	args := []any{name, orgID}
 
 	if excludeID != nil {
 		query += ` AND id != $3`
